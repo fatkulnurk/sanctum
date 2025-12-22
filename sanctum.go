@@ -22,6 +22,9 @@ type Manager interface {
 
 	// FindToken retrieves and validates a token from raw input (plain or "id|plain").
 	FindToken(ctx context.Context, rawToken string) (*PersonalAccessToken[string, string], error)
+
+	// RevokeToken deletes a token by its ID.
+	RevokeToken(ctx context.Context, tokenID string) error
 }
 
 type Config struct {
@@ -124,4 +127,8 @@ func (s Sanctum) CreateToken(ctx context.Context, tokenableID string, tokenableT
 		AccessToken:    hashedToken,
 		PlainTextToken: plainTextToken,
 	}, nil
+}
+
+func (s Sanctum) RevokeToken(ctx context.Context, tokenID string) error {
+	return s.store.Delete(ctx, tokenID)
 }

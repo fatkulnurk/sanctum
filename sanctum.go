@@ -3,23 +3,41 @@ package sanctum
 import (
 	"context"
 	"crypto/subtle"
+	"fmt"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
+type Manager interface {
+	CreateToken(
+		ctx context.Context,
+		tokenableID string,
+		tokenableType string,
+		name string,
+		abilities []string,
+		expiresAt *time.Time,
+	) (*AccessToken, error)
+
+	// FindToken retrieves and validates a token from raw input (plain or "id|plain").
+	FindToken(ctx context.Context, rawToken string) (*PersonalAccessToken[string, string], error)
+}
+
 type Config struct {
-	Prefix string
+	Prefix          string
+	IsAutoIncrement bool
 }
 
 type Sanctum struct {
 	cfg   Config
-	Store Store[string, string]
+	store Store[string, string]
 }
 
-func NewSanctum(cfg Config, store Store[string, string]) *Sanctum {
+func NewSanctum(cfg Config, store Store[string, string]) Manager {
 	return &Sanctum{
 		cfg:   cfg,
-		Store: store,
+		store: store,
 	}
 }
 
@@ -35,7 +53,7 @@ func (s Sanctum) FindToken(ctx context.Context, rawInput string) (*PersonalAcces
 	if idx != -1 {
 		// plain token only, example "abc"
 		hashed := HashToken(rawInput)
-		token, err := s.Store.FindByToken(ctx, hashed)
+		token, err := s.store.FindByToken(ctx, hashed)
 		if err != nil || token == nil {
 			return nil, ErrInvalidToken
 		}
@@ -52,7 +70,7 @@ func (s Sanctum) FindToken(ctx context.Context, rawInput string) (*PersonalAcces
 	id := rawInput[:idx]
 	plain := rawInput[idx+1:]
 
-	token, err := s.Store.FindByID(ctx, id)
+	token, err := s.store.FindByID(ctx, id)
 	if err != nil {
 		return nil, ErrInvalidToken
 	}
@@ -69,4 +87,41 @@ func (s Sanctum) FindToken(ctx context.Context, rawInput string) (*PersonalAcces
 	}
 
 	return token, nil
+}
+
+func (s Sanctum) CreateToken(ctx context.Context, tokenableID string, tokenableType string, name string, abilities []string, expiresAt *time.Time) (*AccessToken, error) {
+	plain, err := GenerateToken(s.cfg.Prefix)
+	if err != nil {
+		return nil, fmt.Errorf("generate token: %w", err)
+	}
+
+	hashed := HashToken(plain)
+	tokenID := ""
+	if !s.cfg.IsAutoIncrement {
+		tokenID = uuid.NewString()
+	}
+
+	token := &PersonalAccessToken[string, string]{
+		ID:            tokenID,
+		TokenableID:   tokenableID,
+		TokenableType: tokenableType,
+		Name:          name,
+		Token:         hashed,
+		Abilities:     Abilities(abilities),
+		CreatedAt:     time.Now(),
+		UpdatedAt:     time.Now(),
+		ExpiresAt:     expiresAt,
+	}
+
+	if err := s.store.Create(ctx, token); err != nil {
+		return nil, fmt.Errorf("store token: %w", err)
+	}
+
+	hashedToken := fmt.Sprintf("%s|%s", token.ID, hashed)
+	plainTextToken := fmt.Sprintf("%s|%s", token.ID, plain)
+
+	return &AccessToken{
+		AccessToken:    hashedToken,
+		PlainTextToken: plainTextToken,
+	}, nil
 }

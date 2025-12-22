@@ -7,18 +7,24 @@ import (
 	"time"
 )
 
+type Config struct {
+	Prefix string
+}
+
 type Sanctum struct {
+	cfg   Config
 	Store Store[string, string]
 }
 
-func NewSanctum(store Store[string, string]) *Sanctum {
+func NewSanctum(cfg Config, store Store[string, string]) *Sanctum {
 	return &Sanctum{
+		cfg:   cfg,
 		Store: store,
 	}
 }
 
 // FindToken retrieves token by raw input (plain or "id|plain" format)
-func (s Sanctum) FindToken(ctx context.Context, rawInput string) (*Token[string, string], error) {
+func (s Sanctum) FindToken(ctx context.Context, rawInput string) (*PersonalAccessToken[string, string], error) {
 	if rawInput == "" {
 		return nil, ErrInvalidToken
 	}

@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-type Token[IDType, TokenableIDType comparable] struct {
+type PersonalAccessToken[IDType, TokenableIDType comparable] struct {
 	ID            IDType          // ada yang ID berupa int64, ada yang uuid atau string, jadi harus generic
 	TokenableID   TokenableIDType // sama seperti ID
 	TokenableType string
@@ -19,7 +19,7 @@ type Token[IDType, TokenableIDType comparable] struct {
 	UpdatedAt     time.Time
 }
 
-func (t Token[IDType, TokenableIDType]) Can(ability string) bool {
+func (t PersonalAccessToken[IDType, TokenableIDType]) Can(ability string) bool {
 	for _, a := range t.Abilities {
 		if a == "*" || a == ability {
 			return true
@@ -29,7 +29,7 @@ func (t Token[IDType, TokenableIDType]) Can(ability string) bool {
 	return false
 }
 
-func (t Token[IDType, TokenableIDType]) Cant(ability string) bool {
+func (t PersonalAccessToken[IDType, TokenableIDType]) Cant(ability string) bool {
 	return !t.Can(ability)
 }
 
@@ -55,4 +55,28 @@ func (a *Abilities) Scan(v interface{}) error {
 	}
 
 	return json.Unmarshal(v.([]byte), a)
+}
+
+type AccessToken struct {
+	AccessToken    string `json:"access_token"`
+	PlainTextToken string `json:"plain_text_token"`
+}
+
+func NewAccessToken(accessToken, plainTextToken string) AccessToken {
+	return AccessToken{
+		AccessToken:    accessToken,
+		PlainTextToken: plainTextToken,
+	}
+}
+
+func (a AccessToken) ToJson() ([]byte, error) {
+	return json.Marshal(a)
+}
+
+func (a AccessToken) ToMap() map[string]string {
+	var m map[string]string
+	m["access_token"] = a.AccessToken
+	m["plain_text_token"] = a.PlainTextToken
+
+	return m
 }

@@ -53,7 +53,7 @@ func (s Sanctum) FindToken(ctx context.Context, rawInput string) (*PersonalAcces
 	now := time.Now()
 
 	idx := strings.Index(rawInput, "|")
-	if idx != -1 {
+	if idx == -1 {
 		// plain token only, example "abc"
 		hashed := HashToken(rawInput)
 		token, err := s.store.FindByToken(ctx, hashed)
@@ -65,6 +65,9 @@ func (s Sanctum) FindToken(ctx context.Context, rawInput string) (*PersonalAcces
 		if token.ExpiresAt != nil && token.ExpiresAt.Before(now) {
 			return nil, ErrTokenExpired
 		}
+
+		// update last used at
+		_ = s.store.UpdateLastUsedAt(ctx, token.ID, now)
 
 		return token, nil
 	}
@@ -88,6 +91,9 @@ func (s Sanctum) FindToken(ctx context.Context, rawInput string) (*PersonalAcces
 	if !isHashValid {
 		return nil, ErrInvalidToken
 	}
+
+	// update last used at
+	_ = s.store.UpdateLastUsedAt(ctx, token.ID, now)
 
 	return token, nil
 }

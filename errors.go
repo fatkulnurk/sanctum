@@ -17,3 +17,19 @@ type MissingAbilityError struct {
 func (e *MissingAbilityError) Error() string {
 	return fmt.Sprintf("missing abilities: %v", e.Abilities)
 }
+
+func (e *MissingAbilityError) AbilitiesList() []string {
+	return e.Abilities
+}
+
+type MissingScopeError struct {
+	Scopes []string
+}
+
+func (e *MissingScopeError) Error() string {
+	return fmt.Sprintf("missing scopes: %v", e.Scopes)
+}
+
+func (e *MissingScopeError) ScopesList() []string {
+	return e.Scopes
+}

@@ -10,6 +10,59 @@ import (
 	"github.com/google/uuid"
 )
 
+type HasApiTokens interface {
+	TokenCan(ability string) bool
+	TokenCant(ability string) bool
+	CurrentAccessToken() HasAbilities
+	WithAccessToken(token HasAbilities)
+}
+
+type HasApiTokensImpl[IDType, TokenableIDType comparable] struct {
+	sanctum  *Sanctum[IDType, TokenableIDType]
+	ctx      context.Context
+	token    HasAbilities
+	userID   TokenableIDType
+	userType string
+}
+
+func NewHasApiTokens[IDType, TokenableIDType comparable](
+	s *Sanctum[IDType, TokenableIDType],
+	ctx context.Context,
+	userID TokenableIDType,
+	userType string,
+) *HasApiTokensImpl[IDType, TokenableIDType] {
+	return &HasApiTokensImpl[IDType, TokenableIDType]{
+		sanctum:  s,
+		ctx:      ctx,
+		userID:   userID,
+		userType: userType,
+	}
+}
+
+func (h *HasApiTokensImpl[IDType, TokenableIDType]) CreateToken(
+	name string,
+	abilities []string,
+	expiresAt *time.Time,
+) (*NewAccessToken[IDType, TokenableIDType], error) {
+	return h.sanctum.CreateToken(h.ctx, h.userID, h.userType, name, abilities, expiresAt)
+}
+
+func (h *HasApiTokensImpl[IDType, TokenableIDType]) TokenCan(ability string) bool {
+	return h.token != nil && h.token.Can(ability)
+}
+
+func (h *HasApiTokensImpl[IDType, TokenableIDType]) TokenCant(ability string) bool {
+	return !h.TokenCan(ability)
+}
+
+func (h *HasApiTokensImpl[IDType, TokenableIDType]) CurrentAccessToken() HasAbilities {
+	return h.token
+}
+
+func (h *HasApiTokensImpl[IDType, TokenableIDType]) WithAccessToken(token HasAbilities) {
+	h.token = token
+}
+
 type Manager[IDType, TokenableIDType comparable] interface {
 	CreateToken(
 		ctx context.Context,
@@ -26,8 +79,13 @@ type Manager[IDType, TokenableIDType comparable] interface {
 
 	TokenCan(token *PersonalAccessToken[IDType, TokenableIDType], ability string) bool
 	TokenCant(token *PersonalAccessToken[IDType, TokenableIDType], ability string) bool
+
 	CheckAbilities(token HasAbilities, abilities ...string) error
 	CheckForAnyAbility(token HasAbilities, abilities ...string) error
+	CheckScopes(token HasAbilities, scopes ...string) error
+	CheckForAnyScope(token HasAbilities, scopes ...string) error
+
+	IsValidBearerToken(token string) bool
 
 	SetTokenRetrievalCallback(callback func(ctx context.Context, rawToken string) (string, error))
 	SetTokenAuthCallback(callback func(token *PersonalAccessToken[IDType, TokenableIDType], isValid bool) (bool, error))
@@ -37,15 +95,19 @@ type Config struct {
 	Prefix          string
 	IsAutoIncrement bool
 	Expiration      *time.Duration
+	ProviderModel   string
 }
 
+type TokenAuthenticatedHandler[IDType, TokenableIDType comparable] func(ctx context.Context, token *PersonalAccessToken[IDType, TokenableIDType])
+
 type Sanctum[IDType, TokenableIDType comparable] struct {
-	cfg      Config
-	store    Store[IDType, TokenableIDType]
-	parseID  func(string) (IDType, error)
-	idGen    func() IDType
-	getToken func(ctx context.Context, rawToken string) (string, error)
-	authCB   func(token *PersonalAccessToken[IDType, TokenableIDType], isValid bool) (bool, error)
+	cfg              Config
+	store            Store[IDType, TokenableIDType]
+	parseID          func(string) (IDType, error)
+	idGen            func() IDType
+	getToken         func(ctx context.Context, rawToken string) (string, error)
+	authCB           func(token *PersonalAccessToken[IDType, TokenableIDType], isValid bool) (bool, error)
+	onAuthenticated  TokenAuthenticatedHandler[IDType, TokenableIDType]
 }
 
 func NewSanctum[IDType, TokenableIDType comparable](
@@ -70,6 +132,7 @@ func NewSanctumWithUUID(cfg Config, store Store[string, string]) *Sanctum[string
 }
 
 func NewSanctumWithAutoIncrement(cfg Config, store Store[string, string]) *Sanctum[string, string] {
+	cfg.IsAutoIncrement = true
 	return NewSanctum(cfg, store,
 		func(s string) (string, error) { return s, nil },
 		nil,
@@ -82,6 +145,28 @@ func (s *Sanctum[IDType, TokenableIDType]) SetTokenRetrievalCallback(callback fu
 
 func (s *Sanctum[IDType, TokenableIDType]) SetTokenAuthCallback(callback func(token *PersonalAccessToken[IDType, TokenableIDType], isValid bool) (bool, error)) {
 	s.authCB = callback
+}
+
+func (s *Sanctum[IDType, TokenableIDType]) OnTokenAuthenticated(handler TokenAuthenticatedHandler[IDType, TokenableIDType]) {
+	s.onAuthenticated = handler
+}
+
+func (s *Sanctum[IDType, TokenableIDType]) IsValidBearerToken(token string) bool {
+	if token == "" {
+		return false
+	}
+	if idx := strings.Index(token, "|"); idx != -1 {
+		if s.cfg.IsAutoIncrement {
+			idStr := token[:idx]
+			for _, c := range idStr {
+				if c < '0' || c > '9' {
+					return false
+				}
+			}
+		}
+		return token[idx+1:] != ""
+	}
+	return token != ""
 }
 
 func (s *Sanctum[IDType, TokenableIDType]) CreateToken(
@@ -142,6 +227,10 @@ func (s *Sanctum[IDType, TokenableIDType]) FindToken(ctx context.Context, rawInp
 		}
 	}
 
+	if !s.IsValidBearerToken(rawInput) {
+		return nil, ErrInvalidToken
+	}
+
 	now := time.Now()
 
 	idx := strings.Index(rawInput, "|")
@@ -158,6 +247,14 @@ func (s *Sanctum[IDType, TokenableIDType]) FindToken(ctx context.Context, rawInp
 
 		if !s.isValidAccessToken(token) {
 			return nil, ErrInvalidToken
+		}
+
+		if err := s.checkProvider(token); err != nil {
+			return nil, err
+		}
+
+		if s.onAuthenticated != nil {
+			s.onAuthenticated(ctx, token)
 		}
 
 		_ = s.store.UpdateLastUsedAt(ctx, token.ID, now)
@@ -187,6 +284,14 @@ func (s *Sanctum[IDType, TokenableIDType]) FindToken(ctx context.Context, rawInp
 
 	if !s.isValidAccessToken(token) {
 		return nil, ErrInvalidToken
+	}
+
+	if err := s.checkProvider(token); err != nil {
+		return nil, err
+	}
+
+	if s.onAuthenticated != nil {
+		s.onAuthenticated(ctx, token)
 	}
 
 	_ = s.store.UpdateLastUsedAt(ctx, token.ID, now)
@@ -237,6 +342,26 @@ func (s *Sanctum[IDType, TokenableIDType]) CheckForAnyAbility(token HasAbilities
 	return &MissingAbilityError{Abilities: abilities}
 }
 
+func (s *Sanctum[IDType, TokenableIDType]) CheckScopes(token HasAbilities, scopes ...string) error {
+	if err := s.CheckAbilities(token, scopes...); err != nil {
+		if _, ok := err.(*MissingAbilityError); ok {
+			return &MissingScopeError{Scopes: scopes}
+		}
+		return err
+	}
+	return nil
+}
+
+func (s *Sanctum[IDType, TokenableIDType]) CheckForAnyScope(token HasAbilities, scopes ...string) error {
+	if err := s.CheckForAnyAbility(token, scopes...); err != nil {
+		if _, ok := err.(*MissingAbilityError); ok {
+			return &MissingScopeError{Scopes: scopes}
+		}
+		return err
+	}
+	return nil
+}
+
 func (s *Sanctum[IDType, TokenableIDType]) checkExpiration(token *PersonalAccessToken[IDType, TokenableIDType], now time.Time) error {
 	if token.ExpiresAt != nil && token.ExpiresAt.Before(now) {
 		return ErrTokenExpired
@@ -261,4 +386,41 @@ func (s *Sanctum[IDType, TokenableIDType]) isValidAccessToken(token *PersonalAcc
 		return false
 	}
 	return valid
+}
+
+func (s *Sanctum[IDType, TokenableIDType]) checkProvider(token *PersonalAccessToken[IDType, TokenableIDType]) error {
+	if s.cfg.ProviderModel == "" {
+		return nil
+	}
+	if token.TokenableType != s.cfg.ProviderModel {
+		return ErrInvalidToken
+	}
+	return nil
+}
+
+type MockToken struct {
+	Abilities []string
+}
+
+func (m *MockToken) Can(ability string) bool {
+	for _, a := range m.Abilities {
+		if a == "*" || a == ability {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *MockToken) Cant(ability string) bool {
+	return !m.Can(ability)
+}
+
+func ActingAs(tokenable HasApiTokens, abilities []string) HasAbilities {
+	if len(abilities) == 1 && abilities[0] == "*" {
+		tokenable.WithAccessToken(TransientToken{})
+		return TransientToken{}
+	}
+	token := &MockToken{Abilities: abilities}
+	tokenable.WithAccessToken(token)
+	return token
 }

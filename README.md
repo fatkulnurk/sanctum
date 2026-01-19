@@ -1,6 +1,7 @@
 # Laravel Sanctum Personal Access Tokens for Golang
 
-[![Status](https://img.shields.io/badge/status-under%20development-orange)](https://github.com/fatkulnurk/sanctum)
+[![Status](https://img.shields.io/badge/status-active-brightgreen)](https://github.com/fatkulnurk/sanctum)
+[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 Laravel Sanctum-compatible personal access tokens for Golang. Generate and validate tokens in the exact same format (`id|plain-token`), use the same database schema, and share tokens seamlessly between Laravel and Go services.
 
@@ -85,7 +86,7 @@ func (s *MemoryStore) FindByToken(ctx context.Context, hashedToken string) (*san
     defer s.mu.RUnlock()
     t, ok := s.tokens[hashedToken]
     if !ok {
-        return nil, sanctum.ErrInvalidToken
+        return nil, nil
     }
     return t, nil
 }
@@ -98,7 +99,7 @@ func (s *MemoryStore) FindByID(ctx context.Context, id string) (*sanctum.Persona
             return t, nil
         }
     }
-    return nil, sanctum.ErrInvalidToken
+    return nil, nil
 }
 
 func (s *MemoryStore) Delete(ctx context.Context, id string) error {
@@ -241,6 +242,16 @@ sanctumManager.TokenCan(token, "read")  // bool
 sanctumManager.TokenCant(token, "write") // bool
 ```
 
+### Scope Checking (deprecated, mirrors Laravel's CheckScopes)
+
+```go
+// Requires ALL scopes (deprecated, use CheckAbilities)
+err := sanctumManager.CheckScopes(token, "read", "write")
+
+// Requires ANY scope (deprecated, use CheckForAnyAbility)
+err = sanctumManager.CheckForAnyScope(token, "admin", "super-admin")
+```
+
 ### Token Expiration
 
 ```go
@@ -273,6 +284,31 @@ var token sanctum.HasAbilities = sanctum.TransientToken{}
 token.Can("anything")  // true
 ```
 
+### HasApiTokens (User Model Integration)
+
+Embed `HasApiTokensImpl` in your user model to get Laravel's `HasApiTokens` trait behavior:
+
+```go
+type User struct {
+    ID   string
+    Name string
+    *sanctum.HasApiTokensImpl[string, string]
+}
+
+// Initialize
+user := &User{ID: "user-uuid-1", Name: "John"}
+user.HasApiTokensImpl = sanctum.NewHasApiTokens(sanctumManager, ctx, user.ID, "App\\Models\\User")
+
+// Create token (like Laravel's $user->createToken())
+result, _ := user.CreateToken("API Token", []string{"*"}, nil)
+
+// Check abilities (like Laravel's $user->tokenCan())
+user.WithAccessToken(result.AccessToken)
+user.TokenCan("read")   // bool
+user.TokenCant("admin") // bool
+user.CurrentAccessToken() // HasAbilities
+```
+
 ### Custom Callbacks
 
 **Custom token extraction** (like `Sanctum::getAccessTokenFromRequestUsing`):
@@ -293,6 +329,149 @@ sanctumManager.SetTokenAuthCallback(func(token *sanctum.PersonalAccessToken[stri
 })
 ```
 
+**Token authenticated callback** (like Laravel's `TokenAuthenticated` event):
+
+```go
+sanctumManager.OnTokenAuthenticated(func(ctx context.Context, token *sanctum.PersonalAccessToken[string, string]) {
+    // Called every time a token is successfully validated
+    log.Printf("Token %s authenticated for user %s", token.ID, token.TokenableID)
+})
+```
+
+### Provider Model Validation
+
+```go
+sanctumManager := sanctum.NewSanctumWithUUID(
+    sanctum.Config{
+        ProviderModel: "App\\Models\\User", // Validate tokenable type
+    },
+    store,
+)
+```
+
+### Testing Helper
+
+```go
+// Like Laravel's Sanctum::actingAs()
+sanctum.ActingAs(user, []string{"read", "write"})
+
+// With wildcard (all abilities)
+sanctum.ActingAs(user, []string{"*"})
+```
+
+## API Comparison: Laravel Sanctum vs Go Sanctum
+
+### Interfaces / Contracts
+
+| Laravel Sanctum | Go Sanctum | Notes |
+|-----------------|------------|-------|
+| `HasAbilities` interface (`can`, `cant`) | `HasAbilities` interface (`Can`, `Cant`) | Exact match |
+| `HasApiTokens` interface (`tokenCan`, `tokenCant`, `createToken`, `currentAccessToken`, `withAccessToken`) | `HasApiTokens` interface + `HasApiTokensImpl` struct | Same methods, Go idiomatic |
+
+### Token Model
+
+| Laravel Sanctum | Go Sanctum | Notes |
+|-----------------|------------|-------|
+| `PersonalAccessToken` (Eloquent model) | `PersonalAccessToken[IDType, TokenableIDType]` | Generic version |
+| `PersonalAccessToken::findToken($token)` | `Sanctum.FindToken(ctx, rawToken)` | Equivalent |
+| `$token->can($ability)` | `$token.Can(ability)` | Exact match |
+| `$token->cant($ability)` | `$token.Cant(ability)` | Exact match |
+| `$token->tokenable()` (MorphTo relation) | Store handles | Not needed in Go |
+
+### NewAccessToken DTO
+
+| Laravel Sanctum | Go Sanctum | Notes |
+|-----------------|------------|-------|
+| `NewAccessToken($accessToken, $plainTextToken)` | `NewAccessToken[IDType, TokenableIDType]{AccessToken, PlainTextToken}` | Exact match |
+| `$dto->toArray()` | `$dto.ToArray()` | Exact match |
+| `$dto->toJson($options)` | `$dto.ToJson()` | Returns `[]byte` in Go |
+
+### TransientToken
+
+| Laravel Sanctum | Go Sanctum | Notes |
+|-----------------|------------|-------|
+| `TransientToken implements HasAbilities` | `TransientToken` struct | Exact match |
+| `$token->can($ability)` → `true` | `$token.Can(ability)` → `true` | Exact match |
+| `$token->cant($ability)` → `false` | `$token.Cant(ability)` → `false` | Exact match |
+
+### Sanctum Utility
+
+| Laravel Sanctum | Go Sanctum | Notes |
+|-----------------|------------|-------|
+| `Sanctum::getAccessTokenFromRequestUsing($callback)` | `SetTokenRetrievalCallback(callback)` | Exact match |
+| `Sanctum::authenticateAccessTokensUsing($callback)` | `SetTokenAuthCallback(callback)` | Exact match |
+| `Sanctum::usePersonalAccessTokenModel($model)` | N/A | Not needed (generics) |
+| `Sanctum::actingAs($user, $abilities, $guard)` | `ActingAs(tokenable, abilities)` | Equivalent |
+| `Sanctum::personalAccessTokenModel()` | N/A | Not needed |
+| `TokenAuthenticated` event | `OnTokenAuthenticated(handler)` | Callback equivalent |
+
+### HasApiTokens (on User model)
+
+| Laravel Sanctum | Go Sanctum | Notes |
+|-----------------|------------|-------|
+| `$user->tokenCan($ability)` | `user.TokenCan(ability)` | Exact match |
+| `$user->tokenCant($ability)` | `user.TokenCant(ability)` | Exact match |
+| `$user->createToken($name, $abilities, $expiresAt)` | `user.CreateToken(name, abilities, expiresAt)` | Exact match |
+| `$user->currentAccessToken()` | `user.CurrentAccessToken()` | Exact match |
+| `$user->withAccessToken($token)` | `user.WithAccessToken(token)` | Exact match |
+| `$user->tokens()` (MorphMany relation) | N/A | Not needed (Store handles) |
+
+### Guard / Token Validation
+
+| Laravel Sanctum | Go Sanctum | Notes |
+|-----------------|------------|-------|
+| `Guard::__invoke($request)` | `Sanctum.FindToken(ctx, rawToken)` | Equivalent |
+| `Guard::isValidBearerToken($token)` | `Sanctum.IsValidBearerToken(token)` | Exact match |
+| `Guard::hasValidProvider($tokenable)` | `Config.ProviderModel` + internal check | Equivalent |
+| `Guard::supportsTokens($tokenable)` | N/A | Not needed in Go |
+| `Guard::updateLastUsedAt($accessToken)` | `Store.UpdateLastUsedAt` | Equivalent |
+
+### Ability / Scope Middleware
+
+| Laravel Sanctum | Go Sanctum | Notes |
+|-----------------|------------|-------|
+| `CheckAbilities` middleware (ALL required) | `Sanctum.CheckAbilities(token, abilities...)` | Equivalent |
+| `CheckForAnyAbility` middleware (ANY required) | `Sanctum.CheckForAnyAbility(token, abilities...)` | Equivalent |
+| `CheckScopes` (deprecated, wraps CheckAbilities) | `Sanctum.CheckScopes(token, scopes...)` | Exact match |
+| `CheckForAnyScope` (deprecated, wraps CheckForAnyAbility) | `Sanctum.CheckForAnyScope(token, scopes...)` | Exact match |
+| `EnsureFrontendRequestsAreStateful` | N/A | HTTP-framework specific |
+
+### Exceptions / Errors
+
+| Laravel Sanctum | Go Sanctum | Notes |
+|-----------------|------------|-------|
+| `MissingAbilityException` | `MissingAbilityError` | Exact match |
+| `MissingAbilityException->abilities()` | `MissingAbilityError.Abilities` | Exact match |
+| `MissingScopeException` (deprecated) | `MissingScopeError` | Exact match |
+| `MissingScopeException->scopes()` | `MissingScopeError.Scopes` | Exact match |
+| `ErrInvalidToken` | `ErrInvalidToken` | Exact match |
+| `ErrTokenExpired` | `ErrTokenExpired` | Exact match |
+
+### Token Generation
+
+| Laravel Sanctum | Go Sanctum | Notes |
+|-----------------|------------|-------|
+| `generateTokenString()` | `GenerateToken(prefix)` | Exact match |
+| `hash('sha256', $plain)` | `HashToken(plain)` | Exact match |
+| Token format: `{prefix}{random(40)}{crc32b}` | Same format | Exact match |
+
+### Pruning
+
+| Laravel Sanctum | Go Sanctum | Notes |
+|-----------------|------------|-------|
+| `sanctum:prune-expired --hours=N` | `Sanctum.PruneExpired(ctx, hours)` | Equivalent |
+
+### Config
+
+| Laravel Sanctum (`config/sanctum.php`) | Go Sanctum (`Config` struct) | Notes |
+|----------------------------------------|------------------------------|-------|
+| `stateful` | N/A | HTTP-framework specific |
+| `guard` | N/A | HTTP-framework specific |
+| `expiration` | `Config.Expiration` | Exact match |
+| `token_prefix` | `Config.Prefix` | Exact match |
+| N/A | `Config.IsAutoIncrement` | Go-specific |
+| N/A | `Config.ProviderModel` | Go-specific |
+
 ## API Reference
 
 ### Types
@@ -300,13 +479,17 @@ sanctumManager.SetTokenAuthCallback(func(token *sanctum.PersonalAccessToken[stri
 | Type | Description |
 |------|-------------|
 | `Sanctum[IDType, TokenableIDType]` | Main manager, generic over ID and tokenable ID types |
-| `Config` | `Prefix`, `IsAutoIncrement`, `Expiration` |
+| `Config` | `Prefix`, `IsAutoIncrement`, `Expiration`, `ProviderModel` |
 | `PersonalAccessToken[IDType, TokenableIDType]` | Token model |
 | `NewAccessToken[IDType, TokenableIDType]` | Returned by `CreateToken` |
 | `Store[IDType, TokenableIDType]` | Storage backend interface |
 | `TransientToken` | Grants all abilities (session auth) |
 | `HasAbilities` | Interface with `Can`/`Cant` |
+| `HasApiTokens` | Interface with `TokenCan`, `TokenCant`, `CurrentAccessToken`, `WithAccessToken` |
+| `HasApiTokensImpl[IDType, TokenableIDType]` | Embeddable struct implementing `HasApiTokens` |
 | `MissingAbilityError` | Error with list of missing abilities |
+| `MissingScopeError` | Deprecated error with list of missing scopes |
+| `MockToken` | Test helper token with configurable abilities |
 
 ### Errors
 
@@ -315,6 +498,7 @@ sanctumManager.SetTokenAuthCallback(func(token *sanctum.PersonalAccessToken[stri
 | `ErrInvalidToken` | Token not found or hash mismatch |
 | `ErrTokenExpired` | Token has expired |
 | `MissingAbilityError` | Required abilities missing |
+| `MissingScopeError` | Required scopes missing (deprecated) |
 
 ### Functions
 
@@ -325,3 +509,5 @@ sanctumManager.SetTokenAuthCallback(func(token *sanctum.PersonalAccessToken[stri
 | `NewSanctum(cfg, store, parseID, idGen)` | Generic constructor |
 | `NewSanctumWithUUID(cfg, store)` | UUID/string IDs |
 | `NewSanctumWithAutoIncrement(cfg, store)` | Auto-increment string IDs |
+| `ActingAs(tokenable, abilities)` | Testing helper (mirrors `Sanctum::actingAs`) |
+| `NewHasApiTokens(sanctum, ctx, userID, userType)` | Create HasApiTokens for a user model |

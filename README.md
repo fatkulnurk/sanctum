@@ -12,6 +12,11 @@ Laravel Sanctum-compatible personal access tokens for Golang. Generate and valid
 - [Installation](#installation)
 - [Quick Start](#quick-start)
   - [1. Implement the Store Interface](#1-implement-the-store-interface)
+    - [Memory Store](#memory-store)
+    - [MySQL Store](#mysql-store)
+    - [PostgreSQL Store](#postgresql-store)
+    - [SQLite Store](#sqlite-store)
+    - [Redis Store](#redis-store)
   - [2. UUID / String IDs](#2-uuid--string-ids)
   - [3. Auto-increment IDs](#3-auto-increment-ids)
   - [4. Custom ID Type](#4-custom-id-type)
@@ -64,10 +69,26 @@ go get github.com/fatkulnurk/sanctum
 The `Store` interface is the only thing you need to implement. It abstracts the database operations and gives you full control over the storage layer:
 
 ```go
+type Store[IDType, TokenableIDType comparable] interface {
+    Create(ctx context.Context, t *PersonalAccessToken[IDType, TokenableIDType]) error
+    FindByToken(ctx context.Context, hashedToken string) (*PersonalAccessToken[IDType, TokenableIDType], error)
+    FindByID(ctx context.Context, id IDType) (*PersonalAccessToken[IDType, TokenableIDType], error)
+    Delete(ctx context.Context, id IDType) error
+    UpdateLastUsedAt(ctx context.Context, id IDType, at time.Time) error
+    PruneExpired(ctx context.Context, beforeTime time.Time) (int64, error)
+}
+```
+
+Below are examples for different storage backends.
+
+#### Memory Store
+
+```go
 import (
     "context"
-    "time"
+    "fmt"
     "sync"
+    "time"
 
     sanctum "github.com/fatkulnurk/sanctum"
 )
@@ -77,11 +98,15 @@ type MemoryStore struct {
     tokens map[string]*sanctum.PersonalAccessToken[string, string]
 }
 
+func NewMemoryStore() *MemoryStore {
+    return &MemoryStore{tokens: make(map[string]*sanctum.PersonalAccessToken[string, string])}
+}
+
 func (s *MemoryStore) Create(ctx context.Context, t *sanctum.PersonalAccessToken[string, string]) error {
     s.mu.Lock()
     defer s.mu.Unlock()
     if t.ID == "" {
-        t.ID = fmt.Sprintf("%d", len(s.tokens)+1) // simulate auto-increment
+        t.ID = fmt.Sprintf("%d", len(s.tokens)+1)
     }
     s.tokens[t.Token] = t
     return nil
@@ -141,6 +166,458 @@ func (s *MemoryStore) PruneExpired(ctx context.Context, beforeTime time.Time) (i
             delete(s.tokens, k)
             count++
         }
+    }
+    return count, nil
+}
+```
+
+#### MySQL Store
+
+```go
+import (
+    "context"
+    "database/sql"
+    "encoding/json"
+    "time"
+
+    sanctum "github.com/fatkulnurk/sanctum"
+    _ "github.com/go-sql-driver/mysql"
+)
+
+type MySQLStore struct {
+    db *sql.DB
+}
+
+func NewMySQLStore(dsn string) (*MySQLStore, error) {
+    db, err := sql.Open("mysql", dsn)
+    if err != nil {
+        return nil, err
+    }
+    return &MySQLStore{db: db}, db.Ping()
+}
+
+func (s *MySQLStore) Create(ctx context.Context, t *sanctum.PersonalAccessToken[string, string]) error {
+    abilities, _ := json.Marshal(t.Abilities)
+    _, err := s.db.ExecContext(ctx,
+        `INSERT INTO personal_access_tokens (id, tokenable_type, tokenable_id, name, token, abilities, expires_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        t.ID, t.TokenableType, t.TokenableID, t.Name, t.Token, abilities, t.ExpiresAt, t.CreatedAt, t.UpdatedAt,
+    )
+    return err
+}
+
+func (s *MySQLStore) FindByToken(ctx context.Context, hashedToken string) (*sanctum.PersonalAccessToken[string, string], error) {
+    row := s.db.QueryRowContext(ctx,
+        `SELECT id, tokenable_type, tokenable_id, name, token, abilities, last_used_at, expires_at, created_at, updated_at
+         FROM personal_access_tokens WHERE token = ?`, hashedToken)
+    return scanToken(row)
+}
+
+func (s *MySQLStore) FindByID(ctx context.Context, id string) (*sanctum.PersonalAccessToken[string, string], error) {
+    row := s.db.QueryRowContext(ctx,
+        `SELECT id, tokenable_type, tokenable_id, name, token, abilities, last_used_at, expires_at, created_at, updated_at
+         FROM personal_access_tokens WHERE id = ?`, id)
+    return scanToken(row)
+}
+
+func (s *MySQLStore) Delete(ctx context.Context, id string) error {
+    _, err := s.db.ExecContext(ctx, `DELETE FROM personal_access_tokens WHERE id = ?`, id)
+    return err
+}
+
+func (s *MySQLStore) UpdateLastUsedAt(ctx context.Context, id string, at time.Time) error {
+    _, err := s.db.ExecContext(ctx, `UPDATE personal_access_tokens SET last_used_at = ? WHERE id = ?`, at, id)
+    return err
+}
+
+func (s *MySQLStore) PruneExpired(ctx context.Context, beforeTime time.Time) (int64, error) {
+    res, err := s.db.ExecContext(ctx, `DELETE FROM personal_access_tokens WHERE expires_at IS NOT NULL AND expires_at < ?`, beforeTime)
+    if err != nil {
+        return 0, err
+    }
+    return res.RowsAffected()
+}
+
+func scanToken(row *sql.Row) (*sanctum.PersonalAccessToken[string, string], error) {
+    t := &sanctum.PersonalAccessToken[string, string]{}
+    var abilities, lastUsedAt, expiresAt sql.NullString
+    err := row.Scan(&t.ID, &t.TokenableType, &t.TokenableID, &t.Name, &t.Token,
+        &abilities, &lastUsedAt, &expiresAt, &t.CreatedAt, &t.UpdatedAt)
+    if err == sql.ErrNoRows {
+        return nil, nil
+    }
+    if err != nil {
+        return nil, err
+    }
+    if abilities.Valid {
+        json.Unmarshal([]byte(abilities.String), &t.Abilities)
+    }
+    if lastUsedAt.Valid {
+        parsed, _ := time.Parse("2006-01-02 15:04:05", lastUsedAt.String)
+        t.LastUsedAt = &parsed
+    }
+    if expiresAt.Valid {
+        parsed, _ := time.Parse("2006-01-02 15:04:05", expiresAt.String)
+        t.ExpiresAt = &parsed
+    }
+    return t, nil
+}
+```
+
+#### PostgreSQL Store
+
+```go
+import (
+    "context"
+    "database/sql"
+    "encoding/json"
+    "time"
+
+    sanctum "github.com/fatkulnurk/sanctum"
+    _ "github.com/lib/pq"
+)
+
+type PostgresStore struct {
+    db *sql.DB
+}
+
+func NewPostgresStore(dsn string) (*PostgresStore, error) {
+    db, err := sql.Open("postgres", dsn)
+    if err != nil {
+        return nil, err
+    }
+    return &PostgresStore{db: db}, db.Ping()
+}
+
+func (s *PostgresStore) Create(ctx context.Context, t *sanctum.PersonalAccessToken[string, string]) error {
+    abilities, _ := json.Marshal(t.Abilities)
+    _, err := s.db.ExecContext(ctx,
+        `INSERT INTO personal_access_tokens (id, tokenable_type, tokenable_id, name, token, abilities, expires_at, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        t.ID, t.TokenableType, t.TokenableID, t.Name, t.Token, abilities, t.ExpiresAt, t.CreatedAt, t.UpdatedAt,
+    )
+    return err
+}
+
+func (s *PostgresStore) FindByToken(ctx context.Context, hashedToken string) (*sanctum.PersonalAccessToken[string, string], error) {
+    row := s.db.QueryRowContext(ctx,
+        `SELECT id, tokenable_type, tokenable_id, name, token, abilities, last_used_at, expires_at, created_at, updated_at
+         FROM personal_access_tokens WHERE token = $1`, hashedToken)
+    return scanToken(row)
+}
+
+func (s *PostgresStore) FindByID(ctx context.Context, id string) (*sanctum.PersonalAccessToken[string, string], error) {
+    row := s.db.QueryRowContext(ctx,
+        `SELECT id, tokenable_type, tokenable_id, name, token, abilities, last_used_at, expires_at, created_at, updated_at
+         FROM personal_access_tokens WHERE id = $1`, id)
+    return scanToken(row)
+}
+
+func (s *PostgresStore) Delete(ctx context.Context, id string) error {
+    _, err := s.db.ExecContext(ctx, `DELETE FROM personal_access_tokens WHERE id = $1`, id)
+    return err
+}
+
+func (s *PostgresStore) UpdateLastUsedAt(ctx context.Context, id string, at time.Time) error {
+    _, err := s.db.ExecContext(ctx, `UPDATE personal_access_tokens SET last_used_at = $1 WHERE id = $2`, at, id)
+    return err
+}
+
+func (s *PostgresStore) PruneExpired(ctx context.Context, beforeTime time.Time) (int64, error) {
+    res, err := s.db.ExecContext(ctx, `DELETE FROM personal_access_tokens WHERE expires_at IS NOT NULL AND expires_at < $1`, beforeTime)
+    if err != nil {
+        return 0, err
+    }
+    return res.RowsAffected()
+}
+
+func scanToken(row *sql.Row) (*sanctum.PersonalAccessToken[string, string], error) {
+    t := &sanctum.PersonalAccessToken[string, string]{}
+    var abilities, lastUsedAt, expiresAt sql.NullString
+    err := row.Scan(&t.ID, &t.TokenableType, &t.TokenableID, &t.Name, &t.Token,
+        &abilities, &lastUsedAt, &expiresAt, &t.CreatedAt, &t.UpdatedAt)
+    if err == sql.ErrNoRows {
+        return nil, nil
+    }
+    if err != nil {
+        return nil, err
+    }
+    if abilities.Valid {
+        json.Unmarshal([]byte(abilities.String), &t.Abilities)
+    }
+    if lastUsedAt.Valid {
+        t.LastUsedAt = &lastUsedAt.Time
+    }
+    if expiresAt.Valid {
+        t.ExpiresAt = &expiresAt.Time
+    }
+    return t, nil
+}
+```
+
+#### SQLite Store
+
+```go
+import (
+    "context"
+    "database/sql"
+    "encoding/json"
+    "time"
+
+    sanctum "github.com/fatkulnurk/sanctum"
+    _ "github.com/mattn/go-sqlite3"
+)
+
+type SQLiteStore struct {
+    db *sql.DB
+}
+
+func NewSQLiteStore(path string) (*SQLiteStore, error) {
+    db, err := sql.Open("sqlite3", path)
+    if err != nil {
+        return nil, err
+    }
+    if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS personal_access_tokens (
+        id TEXT PRIMARY KEY,
+        tokenable_type TEXT NOT NULL,
+        tokenable_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        token TEXT NOT NULL UNIQUE,
+        abilities TEXT,
+        last_used_at DATETIME,
+        expires_at DATETIME,
+        created_at DATETIME NOT NULL,
+        updated_at DATETIME NOT NULL
+    )`); err != nil {
+        return nil, err
+    }
+    return &SQLiteStore{db: db}, nil
+}
+
+func (s *SQLiteStore) Create(ctx context.Context, t *sanctum.PersonalAccessToken[string, string]) error {
+    abilities, _ := json.Marshal(t.Abilities)
+    _, err := s.db.ExecContext(ctx,
+        `INSERT INTO personal_access_tokens (id, tokenable_type, tokenable_id, name, token, abilities, expires_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        t.ID, t.TokenableType, t.TokenableID, t.Name, t.Token, abilities, t.ExpiresAt, t.CreatedAt, t.UpdatedAt,
+    )
+    return err
+}
+
+func (s *SQLiteStore) FindByToken(ctx context.Context, hashedToken string) (*sanctum.PersonalAccessToken[string, string], error) {
+    return s.scanRow(s.db.QueryRowContext(ctx,
+        `SELECT id, tokenable_type, tokenable_id, name, token, abilities, last_used_at, expires_at, created_at, updated_at
+         FROM personal_access_tokens WHERE token = ?`, hashedToken))
+}
+
+func (s *SQLiteStore) FindByID(ctx context.Context, id string) (*sanctum.PersonalAccessToken[string, string], error) {
+    return s.scanRow(s.db.QueryRowContext(ctx,
+        `SELECT id, tokenable_type, tokenable_id, name, token, abilities, last_used_at, expires_at, created_at, updated_at
+         FROM personal_access_tokens WHERE id = ?`, id))
+}
+
+func (s *SQLiteStore) Delete(ctx context.Context, id string) error {
+    _, err := s.db.ExecContext(ctx, `DELETE FROM personal_access_tokens WHERE id = ?`, id)
+    return err
+}
+
+func (s *SQLiteStore) UpdateLastUsedAt(ctx context.Context, id string, at time.Time) error {
+    _, err := s.db.ExecContext(ctx, `UPDATE personal_access_tokens SET last_used_at = ? WHERE id = ?`, at, id)
+    return err
+}
+
+func (s *SQLiteStore) PruneExpired(ctx context.Context, beforeTime time.Time) (int64, error) {
+    res, err := s.db.ExecContext(ctx, `DELETE FROM personal_access_tokens WHERE expires_at IS NOT NULL AND expires_at < ?`, beforeTime)
+    if err != nil {
+        return 0, err
+    }
+    return res.RowsAffected()
+}
+
+func (s *SQLiteStore) scanRow(row *sql.Row) (*sanctum.PersonalAccessToken[string, string], error) {
+    t := &sanctum.PersonalAccessToken[string, string]{}
+    var abilities, lastUsedAt, expiresAt sql.NullString
+    err := row.Scan(&t.ID, &t.TokenableType, &t.TokenableID, &t.Name, &t.Token,
+        &abilities, &lastUsedAt, &expiresAt, &t.CreatedAt, &t.UpdatedAt)
+    if err == sql.ErrNoRows {
+        return nil, nil
+    }
+    if err != nil {
+        return nil, err
+    }
+    if abilities.Valid {
+        json.Unmarshal([]byte(abilities.String), &t.Abilities)
+    }
+    if lastUsedAt.Valid {
+        p, _ := time.Parse("2006-01-02 15:04:05", lastUsedAt.String)
+        t.LastUsedAt = &p
+    }
+    if expiresAt.Valid {
+        p, _ := time.Parse("2006-01-02 15:04:05", expiresAt.String)
+        t.ExpiresAt = &p
+    }
+    return t, nil
+}
+```
+
+#### Redis Store
+
+```go
+import (
+    "context"
+    "encoding/json"
+    "fmt"
+    "time"
+
+    sanctum "github.com/fatkulnurk/sanctum"
+    "github.com/redis/go-redis/v9"
+)
+
+type RedisStore struct {
+    rdb *redis.Client
+}
+
+func NewRedisStore(addr string) *RedisStore {
+    return &RedisStore{
+        rdb: redis.NewClient(&redis.Options{Addr: addr}),
+    }
+}
+
+func tokenKey(hashed string) string  { return "sanctum:token:" + hashed }
+func idKey(id string) string         { return "sanctum:id:" + id }
+
+func tokenToMap(t *sanctum.PersonalAccessToken[string, string]) map[string]interface{} {
+    abilities, _ := json.Marshal(t.Abilities)
+    return map[string]interface{}{
+        "id":             t.ID,
+        "tokenable_type": t.TokenableType,
+        "tokenable_id":   t.TokenableID,
+        "name":           t.Name,
+        "token":          t.Token,
+        "abilities":      string(abilities),
+        "last_used_at":   timePtrToUnix(t.LastUsedAt),
+        "expires_at":     timePtrToUnix(t.ExpiresAt),
+        "created_at":     t.CreatedAt.Unix(),
+        "updated_at":     t.UpdatedAt.Unix(),
+    }
+}
+
+func mapToToken(m map[string]string) *sanctum.PersonalAccessToken[string, string] {
+    t := &sanctum.PersonalAccessToken[string, string]{
+        ID:            m["id"],
+        TokenableType: m["tokenable_type"],
+        TokenableID:   m["tokenable_id"],
+        Name:          m["name"],
+        Token:         m["token"],
+    }
+    abilities := m["abilities"]
+    if abilities != "" {
+        json.Unmarshal([]byte(abilities), &t.Abilities)
+    }
+    if v := m["last_used_at"]; v != "" {
+        t.LastUsedAt = unixToTimePtr(v)
+    }
+    if v := m["expires_at"]; v != "" {
+        t.ExpiresAt = unixToTimePtr(v)
+    }
+    if v := m["created_at"]; v != "" {
+        unix, _ := fmt.Sscanf(v, "%d", &unix)
+        _ = unix
+        t.CreatedAt = time.Unix(unix, 0)
+    }
+    if v := m["updated_at"]; v != "" {
+        unix, _ := fmt.Sscanf(v, "%d", &unix)
+        _ = unix
+        t.UpdatedAt = time.Unix(unix, 0)
+    }
+    return t
+}
+
+func timePtrToUnix(t *time.Time) *int64 {
+    if t == nil {
+        return nil
+    }
+    v := t.Unix()
+    return &v
+}
+
+func unixToTimePtr(s string) *time.Time {
+    var unix int64
+    fmt.Sscanf(s, "%d", &unix)
+    t := time.Unix(unix, 0)
+    return &t
+}
+
+func (s *RedisStore) Create(ctx context.Context, t *sanctum.PersonalAccessToken[string, string]) error {
+    pipe := s.rdb.Pipeline()
+    pipe.HSet(ctx, tokenKey(t.Token), tokenToMap(t))
+    pipe.Set(ctx, idKey(t.ID), t.Token, 0)
+    _, err := pipe.Exec(ctx)
+    return err
+}
+
+func (s *RedisStore) FindByToken(ctx context.Context, hashedToken string) (*sanctum.PersonalAccessToken[string, string], error) {
+    m, err := s.rdb.HGetAll(ctx, tokenKey(hashedToken)).Result()
+    if err != nil || len(m) == 0 {
+        return nil, nil
+    }
+    return mapToToken(m), nil
+}
+
+func (s *RedisStore) FindByID(ctx context.Context, id string) (*sanctum.PersonalAccessToken[string, string], error) {
+    token, err := s.rdb.Get(ctx, idKey(id)).Result()
+    if err != nil {
+        return nil, nil
+    }
+    return s.FindByToken(ctx, token)
+}
+
+func (s *RedisStore) Delete(ctx context.Context, id string) error {
+    token, err := s.rdb.Get(ctx, idKey(id)).Result()
+    if err != nil {
+        return nil
+    }
+    pipe := s.rdb.Pipeline()
+    pipe.Del(ctx, tokenKey(token))
+    pipe.Del(ctx, idKey(id))
+    _, err = pipe.Exec(ctx)
+    return err
+}
+
+func (s *RedisStore) UpdateLastUsedAt(ctx context.Context, id string, at time.Time) error {
+    token, err := s.rdb.Get(ctx, idKey(id)).Result()
+    if err != nil {
+        return nil
+    }
+    return s.rdb.HSet(ctx, tokenKey(token), "last_used_at", at.Unix()).Err()
+}
+
+func (s *RedisStore) PruneExpired(ctx context.Context, beforeTime time.Time) (int64, error) {
+    var cursor uint64
+    var count int64
+    for {
+        keys, next, err := s.rdb.Scan(ctx, cursor, "sanctum:token:*", 100).Result()
+        if err != nil {
+            return count, err
+        }
+        for _, key := range keys {
+            expiresAt, err := s.rdb.HGet(ctx, key, "expires_at").Int64()
+            if err != nil {
+                continue
+            }
+            if time.Unix(expiresAt, 0).Before(beforeTime) {
+                id, _ := s.rdb.HGet(ctx, key, "id").Result()
+                pipe := s.rdb.Pipeline()
+                pipe.Del(ctx, key)
+                pipe.Del(ctx, idKey(id))
+                pipe.Exec(ctx)
+                count++
+            }
+        }
+        if next == 0 {
+            break
+        }
+        cursor = next
     }
     return count, nil
 }

@@ -56,10 +56,16 @@ func (a *Abilities) Scan(v interface{}) error {
 		*a = nil
 		return nil
 	}
-	if b, ok := v.([]byte); ok {
-		return json.Unmarshal(b, a)
+	var data []byte
+	switch val := v.(type) {
+	case []byte:
+		data = val
+	case string:
+		data = []byte(val)
+	default:
+		return json.Unmarshal(val.([]byte), a)
 	}
-	return json.Unmarshal(v.([]byte), a)
+	return json.Unmarshal(data, a)
 }
 
 type NewAccessToken[IDType, TokenableIDType comparable] struct {

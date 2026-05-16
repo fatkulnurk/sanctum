@@ -609,3 +609,318 @@ func IsMissingAbility(err error) bool {
 	_, ok := err.(*MissingAbilityError)
 	return ok
 }
+
+// --- Compile-time interface checks ---
+
+var _ HasApiTokens[string, string] = (*HasApiTokensImpl[string, string])(nil)
+var _ Manager[string, string] = (*Sanctum[string, string])(nil)
+var _ HasAbilities = TransientToken{}
+var _ HasAbilities = (*PersonalAccessToken[string, string])(nil)
+var _ HasAbilities = (*MockToken)(nil)
+
+// --- Additional tests ---
+
+func TestFindTokenWithPlainTextNoPipe(t *testing.T) {
+	store := newTestStore()
+	s := NewSanctumWithUUID(Config{Prefix: ""}, store)
+
+	plain, err := GenerateToken("")
+	if err != nil {
+		t.Fatalf("generate token: %v", err)
+	}
+	hashed := HashToken(plain)
+
+	token := &PersonalAccessToken[string, string]{
+		ID:            "t1",
+		TokenableID:   "1",
+		TokenableType: "App\\Models\\User",
+		Name:          "Plain Test",
+		Token:         hashed,
+		Abilities:     Abilities{"*"},
+		CreatedAt:     time.Now(),
+		UpdatedAt:     time.Now(),
+	}
+	if err := store.Create(context.Background(), token); err != nil {
+		t.Fatalf("store create: %v", err)
+	}
+
+	found, err := s.FindToken(context.Background(), plain)
+	if err != nil {
+		t.Fatalf("FindToken with plain text failed: %v", err)
+	}
+	if found == nil {
+		t.Fatal("token should be found with plain text (no pipe)")
+	}
+	if found.ID != "t1" {
+		t.Errorf("expected token ID 't1', got %q", found.ID)
+	}
+}
+
+func TestFindTokenWithWrongHash(t *testing.T) {
+	store := newTestStore()
+	s := NewSanctumWithUUID(Config{Prefix: ""}, store)
+
+	result, err := s.CreateToken(context.Background(), "1", "App\\Models\\User", "Test", []string{"*"}, nil)
+	if err != nil {
+		t.Fatalf("create token: %v", err)
+	}
+
+	wrongToken := result.AccessToken.ID + "|wrong-hash-here"
+	_, err = s.FindToken(context.Background(), wrongToken)
+	if err != ErrInvalidToken {
+		t.Errorf("expected ErrInvalidToken for wrong hash, got %v", err)
+	}
+}
+
+func TestCreateTokenWithAutoIncrement(t *testing.T) {
+	store := newTestStore()
+	s := NewSanctumWithAutoIncrement(Config{Prefix: "ai_"}, store)
+
+	result, err := s.CreateToken(context.Background(), "42", "App\\Models\\User", "AutoIncrement Token", []string{"read"}, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.PlainTextToken == "" {
+		t.Error("plain text token should not be empty")
+	}
+	if result.AccessToken.TokenableID != "42" {
+		t.Errorf("expected tokenableID '42', got %q", result.AccessToken.TokenableID)
+	}
+}
+
+func TestFindTokenWithAutoIncrement(t *testing.T) {
+	store := newTestStore()
+	s := NewSanctumWithAutoIncrement(Config{Prefix: ""}, store)
+
+	result, err := s.CreateToken(context.Background(), "99", "App\\Models\\User", "AI Find", []string{"*"}, nil)
+	if err != nil {
+		t.Fatalf("create token: %v", err)
+	}
+
+	found, err := s.FindToken(context.Background(), result.PlainTextToken)
+	if err != nil {
+		t.Fatalf("FindToken: %v", err)
+	}
+	if found == nil {
+		t.Fatal("token should be found")
+	}
+	if found.TokenableID != "99" {
+		t.Errorf("expected tokenableID '99', got %q", found.TokenableID)
+	}
+}
+
+func TestPruneExpiredWithGlobalExpiration(t *testing.T) {
+	store := newTestStore()
+	expiration := 1 * time.Hour
+	s := NewSanctumWithUUID(Config{Prefix: "", Expiration: &expiration}, store)
+
+	past := time.Now().Add(-2 * time.Hour)
+	_, err := s.CreateToken(context.Background(), "1", "App\\Models\\User", "Expired", []string{"*"}, &past)
+	if err != nil {
+		t.Fatalf("create token: %v", err)
+	}
+
+	future := time.Now().Add(2 * time.Hour)
+	_, err = s.CreateToken(context.Background(), "2", "App\\Models\\User", "Valid", []string{"*"}, &future)
+	if err != nil {
+		t.Fatalf("create token: %v", err)
+	}
+
+	if err := s.PruneExpired(context.Background(), 1); err != nil {
+		t.Fatalf("PruneExpired: %v", err)
+	}
+
+	if len(store.tokens) != 1 {
+		t.Errorf("expected 1 token after prune, got %d", len(store.tokens))
+	}
+}
+
+func TestCheckAbilitiesWithWildcardToken(t *testing.T) {
+	store := newTestStore()
+	s := NewSanctumWithUUID(Config{Prefix: ""}, store)
+
+	result, err := s.CreateToken(context.Background(), "1", "App\\Models\\User", "Wild", []string{"*"}, nil)
+	if err != nil {
+		t.Fatalf("create token: %v", err)
+	}
+
+	if err := s.CheckAbilities(result.AccessToken, "anything", "read", "write", "admin"); err != nil {
+		t.Error("wildcard token should pass any ability check")
+	}
+}
+
+func TestMissingAbilityErrorMessage(t *testing.T) {
+	err := &MissingAbilityError{Abilities: []string{"read", "write"}}
+	msg := err.Error()
+	if msg == "" {
+		t.Error("error message should not be empty")
+	}
+	if !contains(msg, "read") || !contains(msg, "write") {
+		t.Error("error message should contain the missing abilities")
+	}
+}
+
+func TestMissingAbilityErrorAbilitiesList(t *testing.T) {
+	err := &MissingAbilityError{Abilities: []string{"admin"}}
+	list := err.AbilitiesList()
+	if len(list) != 1 || list[0] != "admin" {
+		t.Error("AbilitiesList should return the abilities")
+	}
+}
+
+func TestMissingScopeErrorMessage(t *testing.T) {
+	err := &MissingScopeError{Scopes: []string{"read", "write"}}
+	msg := err.Error()
+	if msg == "" {
+		t.Error("error message should not be empty")
+	}
+	if !contains(msg, "read") || !contains(msg, "write") {
+		t.Error("error message should contain the missing scopes")
+	}
+}
+
+func TestMissingScopeErrorScopesList(t *testing.T) {
+	err := &MissingScopeError{Scopes: []string{"admin"}}
+	list := err.ScopesList()
+	if len(list) != 1 || list[0] != "admin" {
+		t.Error("ScopesList should return the scopes")
+	}
+}
+
+func TestFindTokenWithRetrievalCallbackError(t *testing.T) {
+	store := newTestStore()
+	s := NewSanctumWithUUID(Config{Prefix: ""}, store)
+
+	_, err := s.CreateToken(context.Background(), "1", "App\\Models\\User", "Test", []string{"*"}, nil)
+	if err != nil {
+		t.Fatalf("create token: %v", err)
+	}
+
+	s.SetTokenRetrievalCallback(func(ctx context.Context, rawToken string) (string, error) {
+		return "", fmt.Errorf("callback error")
+	})
+
+	_, err = s.FindToken(context.Background(), "anything")
+	if err != ErrInvalidToken {
+		t.Errorf("expected ErrInvalidToken when callback returns error, got %v", err)
+	}
+}
+
+func TestFindTokenWithAuthCallbackError(t *testing.T) {
+	store := newTestStore()
+	s := NewSanctumWithUUID(Config{Prefix: ""}, store)
+
+	result, err := s.CreateToken(context.Background(), "1", "App\\Models\\User", "Test", []string{"*"}, nil)
+	if err != nil {
+		t.Fatalf("create token: %v", err)
+	}
+
+	s.SetTokenAuthCallback(func(token *PersonalAccessToken[string, string], isValid bool) (bool, error) {
+		return false, fmt.Errorf("auth error")
+	})
+
+	_, err = s.FindToken(context.Background(), result.PlainTextToken)
+	if err != ErrInvalidToken {
+		t.Errorf("expected ErrInvalidToken when auth callback errors, got %v", err)
+	}
+}
+
+func TestRevokeTokenNotFound(t *testing.T) {
+	store := newTestStore()
+	s := NewSanctumWithUUID(Config{Prefix: ""}, store)
+
+	err := s.RevokeToken(context.Background(), "nonexistent")
+	if err != nil {
+		t.Errorf("revoking nonexistent token should not error, got %v", err)
+	}
+}
+
+func TestHasApiTokensTokenCant(t *testing.T) {
+	store := newTestStore()
+	s := NewSanctumWithUUID(Config{Prefix: ""}, store)
+
+	user := NewHasApiTokens(s, context.Background(), "user-1", "App\\Models\\User")
+
+	if user.TokenCan("anything") {
+		t.Error("TokenCan should return false when no access token set")
+	}
+	if !user.TokenCant("anything") {
+		t.Error("TokenCant should return true when no access token set")
+	}
+}
+
+func TestCreateTokenReturnsDifferentPlainText(t *testing.T) {
+	store := newTestStore()
+	s := NewSanctumWithUUID(Config{Prefix: ""}, store)
+
+	r1, _ := s.CreateToken(context.Background(), "1", "App\\Models\\User", "A", []string{"*"}, nil)
+	r2, _ := s.CreateToken(context.Background(), "1", "App\\Models\\User", "B", []string{"*"}, nil)
+
+	if r1.PlainTextToken == r2.PlainTextToken {
+		t.Error("two separate tokens should have different plain text")
+	}
+}
+
+func TestIsValidBearerTokenWithEmptyID(t *testing.T) {
+	store := newTestStore()
+	s := NewSanctumWithAutoIncrement(Config{Prefix: ""}, store)
+
+	if s.IsValidBearerToken("|token") {
+		t.Error("empty id with pipe should be invalid in auto-increment mode")
+	}
+}
+
+func TestManagerInterface(t *testing.T) {
+	store := newTestStore()
+	s := NewSanctumWithUUID(Config{Prefix: ""}, store)
+
+	var m Manager[string, string] = s
+
+	result, err := m.CreateToken(context.Background(), "1", "App\\Models\\User", "Manager Test", []string{"*"}, nil)
+	if err != nil {
+		t.Fatalf("CreateToken via Manager: %v", err)
+	}
+	if result.AccessToken.Name != "Manager Test" {
+		t.Error("Manager interface should work correctly")
+	}
+
+	found, err := m.FindToken(context.Background(), result.PlainTextToken)
+	if err != nil {
+		t.Fatalf("FindToken via Manager: %v", err)
+	}
+	if found == nil {
+		t.Fatal("Manager FindToken should find the token")
+	}
+
+	m.SetTokenAuthCallback(func(token *PersonalAccessToken[string, string], isValid bool) (bool, error) {
+		return true, nil
+	})
+
+	m.OnTokenAuthenticated(func(ctx context.Context, token *PersonalAccessToken[string, string]) {})
+
+	_ = m
+}
+
+func TestSanctumTokenCanCantOnTransient(t *testing.T) {
+	store := newTestStore()
+	s := NewSanctumWithUUID(Config{Prefix: ""}, store)
+
+	user := NewHasApiTokens(s, context.Background(), "1", "App\\Models\\User")
+	user.WithAccessToken(TransientToken{})
+
+	if !user.TokenCan("anything") {
+		t.Error("TransientToken should allow any ability")
+	}
+	if user.TokenCant("anything") {
+		t.Error("TransientToken should not cant anything")
+	}
+}
+
+func contains(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
+}

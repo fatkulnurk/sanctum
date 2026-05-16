@@ -160,6 +160,9 @@ func (s *Sanctum[IDType, TokenableIDType]) IsValidBearerToken(token string) bool
 	if idx := strings.Index(token, "|"); idx != -1 {
 		if s.cfg.IsAutoIncrement {
 			idStr := token[:idx]
+			if idStr == "" {
+				return false
+			}
 			for _, c := range idStr {
 				if c < '0' || c > '9' {
 					return false

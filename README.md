@@ -5,57 +5,63 @@
 
 Laravel Sanctum-compatible personal access tokens for Golang. Generate and validate tokens in the exact same format (`id|plain-token`), use the same database schema, and share tokens seamlessly between Laravel and Go services.
 
+---
+
+## Table of Contents
+
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+  - [1. Implement the Store Interface](#1-implement-the-store-interface)
+  - [2. UUID / String IDs](#2-uuid--string-ids)
+  - [3. Auto-increment IDs](#3-auto-increment-ids)
+  - [4. Custom ID Type](#4-custom-id-type)
+- [Features](#features)
+  - [Token Creation & Validation](#token-creation--validation)
+  - [Ability Checking](#ability-checking)
+  - [Scope Checking (Deprecated)](#scope-checking-deprecated)
+  - [Token Expiration](#token-expiration)
+  - [Prune Expired Tokens](#prune-expired-tokens)
+  - [TransientToken (Session Auth)](#transienttoken-session-auth)
+  - [Provider Model Validation](#provider-model-validation)
+  - [Custom Callbacks](#custom-callbacks)
+  - [Testing Helper](#testing-helper)
+- [HasApiTokens (User Model Integration)](#hasapitokens-user-model-integration)
+- [API Reference](#api-reference)
+  - [Types](#types)
+  - [Errors](#errors)
+  - [Functions](#functions)
+- [API Comparison: Laravel Sanctum vs Go Sanctum](#api-comparison-laravel-sanctum-vs-go-sanctum)
+  - [Interfaces / Contracts](#interfaces--contracts)
+  - [Token Model](#token-model)
+  - [NewAccessToken DTO](#newaccesstoken-dto)
+  - [TransientToken](#transienttoken)
+  - [Sanctum Utility](#sanctum-utility)
+  - [HasApiTokens (on User model)](#hasapitokens-on-user-model)
+  - [Guard / Token Validation](#guard--token-validation)
+  - [Ability / Scope Middleware](#ability--scope-middleware)
+  - [Exceptions / Errors](#exceptions--errors)
+  - [Token Generation](#token-generation)
+  - [Pruning](#pruning)
+  - [Config](#config)
+- [Database Schema](#database-schema)
+  - [Auto-increment (int/bigint)](#auto-increment-intbigint)
+  - [UUID / String](#uuid--string)
+
+---
+
 ## Installation
 
 ```bash
 go get github.com/fatkulnurk/sanctum
 ```
 
-## Database Schema
-
-The package supports two ID strategies matching Laravel Sanctum's configuration.
-
-### Auto-increment (int/bigint)
-
-Default Laravel migration using `$table->id()`:
-
-```sql
-CREATE TABLE personal_access_tokens (
-    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    tokenable_type VARCHAR(255) NOT NULL,
-    tokenable_id BIGINT UNSIGNED NOT NULL,
-    name TEXT NOT NULL,
-    token VARCHAR(64) NOT NULL UNIQUE,
-    abilities TEXT NULL,
-    last_used_at TIMESTAMP NULL,
-    expires_at TIMESTAMP NULL INDEX,
-    created_at TIMESTAMP NOT NULL,
-    updated_at TIMESTAMP NOT NULL
-);
-```
-
-### UUID / String
-
-If your app uses UUID keys (`$table->uuid('id')->primary()` on tokenable):
-
-```sql
-CREATE TABLE personal_access_tokens (
-    id CHAR(36) PRIMARY KEY,
-    tokenable_type VARCHAR(255) NOT NULL,
-    tokenable_id CHAR(36) NOT NULL,
-    name TEXT NOT NULL,
-    token VARCHAR(64) NOT NULL UNIQUE,
-    abilities TEXT NULL,
-    last_used_at TIMESTAMP NULL,
-    expires_at TIMESTAMP NULL,
-    created_at TIMESTAMP NOT NULL,
-    updated_at TIMESTAMP NOT NULL
-);
-```
+---
 
 ## Quick Start
 
-### 1. Implement the Store interface
+### 1. Implement the Store Interface
+
+The `Store` interface is the only thing you need to implement. It abstracts the database operations and gives you full control over the storage layer:
 
 ```go
 import (
@@ -140,7 +146,9 @@ func (s *MemoryStore) PruneExpired(ctx context.Context, beforeTime time.Time) (i
 }
 ```
 
-### 2. UUID / String IDs (e.g. sharing with Laravel using UUIDs)
+### 2. UUID / String IDs
+
+For applications using UUID keys (matching Laravel's UUID configuration):
 
 ```go
 store := &MemoryStore{}
@@ -181,7 +189,9 @@ err = sanctumManager.CheckForAnyAbility(token, "admin", "super-admin")
 sanctumManager.RevokeToken(ctx, token.ID)
 ```
 
-### 3. Auto-increment IDs (int/bigint)
+### 3. Auto-increment IDs
+
+For applications using auto-increment integer IDs (matching Laravel's default migration):
 
 ```go
 store := &MemoryStore{}
@@ -207,7 +217,7 @@ fmt.Println(result.PlainTextToken)
 // Output: 1|myapp_Random40CharsCrc32
 ```
 
-### 4. Custom ID type (generic Sanctum)
+### 4. Custom ID Type
 
 For full control, use `NewSanctum` directly with your own ID types and parsers:
 
@@ -222,7 +232,22 @@ sanctum.NewSanctum[int64, string](
 )
 ```
 
+---
+
 ## Features
+
+### Token Creation & Validation
+
+Create tokens with customizable abilities and expiration, then validate them with the `id|plain-text` format that Laravel uses:
+
+```go
+result, err := sanctumManager.CreateToken(ctx, userID, userType, name, abilities, expiresAt)
+// result.PlainTextToken -> "1|random40charsCRC32"
+// result.AccessToken    -> *PersonalAccessToken
+
+token, err := sanctumManager.FindToken(ctx, "1|random40charsCRC32")
+// Returns the token or ErrInvalidToken / ErrTokenExpired
+```
 
 ### Ability Checking
 
@@ -242,7 +267,9 @@ sanctumManager.TokenCan(token, "read")  // bool
 sanctumManager.TokenCant(token, "write") // bool
 ```
 
-### Scope Checking (deprecated, mirrors Laravel's CheckScopes)
+### Scope Checking (deprecated)
+
+Mirrors Laravel's deprecated `CheckScopes` and `CheckForAnyScope`:
 
 ```go
 // Requires ALL scopes (deprecated, use CheckAbilities)
@@ -254,10 +281,12 @@ err = sanctumManager.CheckForAnyScope(token, "admin", "super-admin")
 
 ### Token Expiration
 
+Support both per-token expiration and global expiration duration:
+
 ```go
 // Per-token expiration
 expiresAt := time.Now().Add(24 * time.Hour)
-result, _ := sanctumManager.CreateToken(ctx, id, type, name, abilities, &expiresAt)
+result, _ := sanctumManager.CreateToken(ctx, id, userType, name, abilities, &expiresAt)
 
 // Global expiration (applied to all tokens without individual expires_at)
 sanctumManager := sanctum.NewSanctumWithUUID(
@@ -269,6 +298,8 @@ sanctumManager := sanctum.NewSanctumWithUUID(
 ```
 
 ### Prune Expired Tokens
+
+Remove tokens that have been expired beyond a specified hour threshold:
 
 ```go
 // Remove tokens expired for more than 24 hours
@@ -284,29 +315,17 @@ var token sanctum.HasAbilities = sanctum.TransientToken{}
 token.Can("anything")  // true
 ```
 
-### HasApiTokens (User Model Integration)
+### Provider Model Validation
 
-Embed `HasApiTokensImpl` in your user model to get Laravel's `HasApiTokens` trait behavior:
+Restrict tokens to a specific tokenable type:
 
 ```go
-type User struct {
-    ID   string
-    Name string
-    *sanctum.HasApiTokensImpl[string, string]
-}
-
-// Initialize
-user := &User{ID: "user-uuid-1", Name: "John"}
-user.HasApiTokensImpl = sanctum.NewHasApiTokens(sanctumManager, ctx, user.ID, "App\\Models\\User")
-
-// Create token (like Laravel's $user->createToken())
-result, _ := user.CreateToken("API Token", []string{"*"}, nil)
-
-// Check abilities (like Laravel's $user->tokenCan())
-user.WithAccessToken(result.AccessToken)
-user.TokenCan("read")   // bool
-user.TokenCant("admin") // bool
-user.CurrentAccessToken() // HasAbilities
+sanctumManager := sanctum.NewSanctumWithUUID(
+    sanctum.Config{
+        ProviderModel: "App\\Models\\User", // Validate tokenable type
+    },
+    store,
+)
 ```
 
 ### Custom Callbacks
@@ -338,17 +357,6 @@ sanctumManager.OnTokenAuthenticated(func(ctx context.Context, token *sanctum.Per
 })
 ```
 
-### Provider Model Validation
-
-```go
-sanctumManager := sanctum.NewSanctumWithUUID(
-    sanctum.Config{
-        ProviderModel: "App\\Models\\User", // Validate tokenable type
-    },
-    store,
-)
-```
-
 ### Testing Helper
 
 ```go
@@ -359,6 +367,77 @@ sanctum.ActingAs(user, []string{"read", "write"})
 sanctum.ActingAs(user, []string{"*"})
 ```
 
+---
+
+## HasApiTokens (User Model Integration)
+
+Embed `HasApiTokensImpl` in your user model to get Laravel's `HasApiTokens` trait behavior:
+
+```go
+type User struct {
+    ID   string
+    Name string
+    *sanctum.HasApiTokensImpl[string, string]
+}
+
+// Initialize
+user := &User{ID: "user-uuid-1", Name: "John"}
+user.HasApiTokensImpl = sanctum.NewHasApiTokens(sanctumManager, ctx, user.ID, "App\\Models\\User")
+
+// Create token (like Laravel's $user->createToken())
+result, _ := user.CreateToken("API Token", []string{"*"}, nil)
+
+// Check abilities (like Laravel's $user->tokenCan())
+user.WithAccessToken(result.AccessToken)
+user.TokenCan("read")   // bool
+user.TokenCant("admin") // bool
+user.CurrentAccessToken() // HasAbilities
+```
+
+---
+
+## API Reference
+
+### Types
+
+| Type | Description |
+|------|-------------|
+| `Sanctum[IDType, TokenableIDType]` | Main manager, generic over ID and tokenable ID types |
+| `Config` | `Prefix`, `IsAutoIncrement`, `Expiration`, `ProviderModel` |
+| `PersonalAccessToken[IDType, TokenableIDType]` | Token model |
+| `NewAccessToken[IDType, TokenableIDType]` | Returned by `CreateToken` |
+| `Store[IDType, TokenableIDType]` | Storage backend interface |
+| `TransientToken` | Grants all abilities (session auth) |
+| `HasAbilities` | Interface with `Can`/`Cant` |
+| `HasApiTokens[IDType, TokenableIDType]` | Generic interface with `TokenCan`, `TokenCant`, `CreateToken`, `CurrentAccessToken`, `WithAccessToken` |
+| `HasApiTokensImpl[IDType, TokenableIDType]` | Embeddable struct implementing `HasApiTokens` |
+| `MissingAbilityError` | Error with list of missing abilities |
+| `MissingScopeError` | Deprecated error with list of missing scopes |
+| `MockToken` | Test helper token with configurable abilities |
+
+### Errors
+
+| Error | Description |
+|-------|-------------|
+| `ErrInvalidToken` | Token not found or hash mismatch |
+| `ErrTokenExpired` | Token has expired |
+| `MissingAbilityError` | Required abilities missing |
+| `MissingScopeError` | Required scopes missing (deprecated) |
+
+### Functions
+
+| Function | Description |
+|----------|-------------|
+| `GenerateToken(prefix)` | Generate `prefix + random(40) + crc32` |
+| `HashToken(plain)` | SHA-256 hex of input |
+| `NewSanctum(cfg, store, parseID, idGen)` | Generic constructor |
+| `NewSanctumWithUUID(cfg, store)` | UUID/string IDs |
+| `NewSanctumWithAutoIncrement(cfg, store)` | Auto-increment string IDs |
+| `ActingAs(tokenable, abilities)` | Testing helper (mirrors `Sanctum::actingAs`) |
+| `NewHasApiTokens(sanctum, ctx, userID, userType)` | Create HasApiTokens for a user model |
+
+---
+
 ## API Comparison: Laravel Sanctum vs Go Sanctum
 
 ### Interfaces / Contracts
@@ -366,7 +445,7 @@ sanctum.ActingAs(user, []string{"*"})
 | Laravel Sanctum | Go Sanctum | Notes |
 |-----------------|------------|-------|
 | `HasAbilities` interface (`can`, `cant`) | `HasAbilities` interface (`Can`, `Cant`) | Exact match |
-| `HasApiTokens` interface (`tokenCan`, `tokenCant`, `createToken`, `currentAccessToken`, `withAccessToken`) | `HasApiTokens` interface + `HasApiTokensImpl` struct | Same methods, Go idiomatic |
+| `HasApiTokens` interface (`tokenCan`, `tokenCant`, `createToken`, `currentAccessToken`, `withAccessToken`) | `HasApiTokens[IDType, TokenableIDType]` generic interface | Same methods, Go idiomatic |
 
 ### Token Model
 
@@ -472,42 +551,46 @@ sanctum.ActingAs(user, []string{"*"})
 | N/A | `Config.IsAutoIncrement` | Go-specific |
 | N/A | `Config.ProviderModel` | Go-specific |
 
-## API Reference
+---
 
-### Types
+## Database Schema
 
-| Type | Description |
-|------|-------------|
-| `Sanctum[IDType, TokenableIDType]` | Main manager, generic over ID and tokenable ID types |
-| `Config` | `Prefix`, `IsAutoIncrement`, `Expiration`, `ProviderModel` |
-| `PersonalAccessToken[IDType, TokenableIDType]` | Token model |
-| `NewAccessToken[IDType, TokenableIDType]` | Returned by `CreateToken` |
-| `Store[IDType, TokenableIDType]` | Storage backend interface |
-| `TransientToken` | Grants all abilities (session auth) |
-| `HasAbilities` | Interface with `Can`/`Cant` |
-| `HasApiTokens[IDType, TokenableIDType]` | Generic interface with `TokenCan`, `TokenCant`, `CreateToken`, `CurrentAccessToken`, `WithAccessToken` |
-| `HasApiTokensImpl[IDType, TokenableIDType]` | Embeddable struct implementing `HasApiTokens` |
-| `MissingAbilityError` | Error with list of missing abilities |
-| `MissingScopeError` | Deprecated error with list of missing scopes |
-| `MockToken` | Test helper token with configurable abilities |
+The package supports two ID strategies matching Laravel Sanctum's configuration.
 
-### Errors
+### Auto-increment (int/bigint)
 
-| Error | Description |
-|-------|-------------|
-| `ErrInvalidToken` | Token not found or hash mismatch |
-| `ErrTokenExpired` | Token has expired |
-| `MissingAbilityError` | Required abilities missing |
-| `MissingScopeError` | Required scopes missing (deprecated) |
+Default Laravel migration using `$table->id()`:
 
-### Functions
+```sql
+CREATE TABLE personal_access_tokens (
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    tokenable_type VARCHAR(255) NOT NULL,
+    tokenable_id BIGINT UNSIGNED NOT NULL,
+    name TEXT NOT NULL,
+    token VARCHAR(64) NOT NULL UNIQUE,
+    abilities TEXT NULL,
+    last_used_at TIMESTAMP NULL,
+    expires_at TIMESTAMP NULL INDEX,
+    created_at TIMESTAMP NOT NULL,
+    updated_at TIMESTAMP NOT NULL
+);
+```
 
-| Function | Description |
-|----------|-------------|
-| `GenerateToken(prefix)` | Generate `prefix + random(40) + crc32` |
-| `HashToken(plain)` | SHA-256 hex of input |
-| `NewSanctum(cfg, store, parseID, idGen)` | Generic constructor |
-| `NewSanctumWithUUID(cfg, store)` | UUID/string IDs |
-| `NewSanctumWithAutoIncrement(cfg, store)` | Auto-increment string IDs |
-| `ActingAs(tokenable, abilities)` | Testing helper (mirrors `Sanctum::actingAs`) |
-| `NewHasApiTokens(sanctum, ctx, userID, userType)` | Create HasApiTokens for a user model |
+### UUID / String
+
+If your app uses UUID keys (`$table->uuid('id')->primary()` on tokenable):
+
+```sql
+CREATE TABLE personal_access_tokens (
+    id CHAR(36) PRIMARY KEY,
+    tokenable_type VARCHAR(255) NOT NULL,
+    tokenable_id CHAR(36) NOT NULL,
+    name TEXT NOT NULL,
+    token VARCHAR(64) NOT NULL UNIQUE,
+    abilities TEXT NULL,
+    last_used_at TIMESTAMP NULL,
+    expires_at TIMESTAMP NULL,
+    created_at TIMESTAMP NOT NULL,
+    updated_at TIMESTAMP NOT NULL
+);
+```

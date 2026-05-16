@@ -10,9 +10,10 @@ import (
 	"github.com/google/uuid"
 )
 
-type HasApiTokens interface {
+type HasApiTokens[IDType, TokenableIDType comparable] interface {
 	TokenCan(ability string) bool
 	TokenCant(ability string) bool
+	CreateToken(name string, abilities []string, expiresAt *time.Time) (*NewAccessToken[IDType, TokenableIDType], error)
 	CurrentAccessToken() HasAbilities
 	WithAccessToken(token HasAbilities)
 }
@@ -89,6 +90,7 @@ type Manager[IDType, TokenableIDType comparable] interface {
 
 	SetTokenRetrievalCallback(callback func(ctx context.Context, rawToken string) (string, error))
 	SetTokenAuthCallback(callback func(token *PersonalAccessToken[IDType, TokenableIDType], isValid bool) (bool, error))
+	OnTokenAuthenticated(handler TokenAuthenticatedHandler[IDType, TokenableIDType])
 }
 
 type Config struct {
@@ -415,7 +417,7 @@ func (m *MockToken) Cant(ability string) bool {
 	return !m.Can(ability)
 }
 
-func ActingAs(tokenable HasApiTokens, abilities []string) HasAbilities {
+func ActingAs[IDType, TokenableIDType comparable](tokenable HasApiTokens[IDType, TokenableIDType], abilities []string) HasAbilities {
 	if len(abilities) == 1 && abilities[0] == "*" {
 		tokenable.WithAccessToken(TransientToken{})
 		return TransientToken{}

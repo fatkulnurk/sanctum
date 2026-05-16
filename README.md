@@ -485,7 +485,7 @@ sanctum.ActingAs(user, []string{"*"})
 | `Store[IDType, TokenableIDType]` | Storage backend interface |
 | `TransientToken` | Grants all abilities (session auth) |
 | `HasAbilities` | Interface with `Can`/`Cant` |
-| `HasApiTokens` | Interface with `TokenCan`, `TokenCant`, `CurrentAccessToken`, `WithAccessToken` |
+| `HasApiTokens[IDType, TokenableIDType]` | Generic interface with `TokenCan`, `TokenCant`, `CreateToken`, `CurrentAccessToken`, `WithAccessToken` |
 | `HasApiTokensImpl[IDType, TokenableIDType]` | Embeddable struct implementing `HasApiTokens` |
 | `MissingAbilityError` | Error with list of missing abilities |
 | `MissingScopeError` | Deprecated error with list of missing scopes |

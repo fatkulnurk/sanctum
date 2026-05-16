@@ -30,8 +30,8 @@ func GenerateToken(prefix string) (string, error) {
 	crc := crc32.ChecksumIEEE([]byte(randomStr))
 	crcHex := fmt.Sprintf("%08x", crc) // 8 hex chars, lowercase
 
-	// 3. combine with prefix
-	return prefix + crcHex + randomStr, nil
+	// 3. combine with prefix (matches Laravel: prefix + random(40) + crc32b)
+	return prefix + randomStr + crcHex, nil
 }
 
 // HashToken return the SHA-256 hash (hex-decoded) of plain text
